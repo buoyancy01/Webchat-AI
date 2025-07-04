@@ -264,7 +264,7 @@ def register():
         username = data.get('username')
         email = data.get('email')
         password = data.get('password')
-        company_name = data.get('company_name', '')
+        company_name = data.get("company_name")
         
         if User.query.filter_by(username=username).first():
             return jsonify({'message': 'Username already exists'}), 400
