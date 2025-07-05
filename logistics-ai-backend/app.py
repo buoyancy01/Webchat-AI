@@ -1,5 +1,5 @@
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS, cross_origin  # Required for CORS
+from flask import Flask, request, jsonify
+from flask_cors import CORS, cross_origin
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,13 +13,12 @@ import imaplib
 import email
 import re
 import threading
-import time
 
 # Initialize Flask app
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 
-# Use PostgreSQL (required for Render)
+# Use PostgreSQL on Render
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///logistics_production.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -31,7 +30,7 @@ app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
 app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
 app.config['IMAP_SERVER'] = os.environ.get('IMAP_SERVER', 'imap.gmail.com')
 
-# Initialize extensions
+# Setup extensions
 CORS(app, resources={r"/*": {"origins": "*", "allow_headers": ["Authorization", "Content-Type"]}}, supports_credentials=True)
 db = SQLAlchemy(app)
 mail = Mail(app)
@@ -64,17 +63,10 @@ class Shipment(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
-class ChatSession(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    messages = db.Column(db.Text, nullable=True)  # JSON string
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
 # JWT Token decorator (skips OPTIONS requests)
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Skip token check for OPTIONS requests
         if request.method == 'OPTIONS':
             return f(*args, **kwargs)
 
@@ -85,8 +77,8 @@ def token_required(f):
             token = token.replace('Bearer ', '')
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
             current_user = User.query.get(data['user_id'])
-        except:
-            return jsonify({'message': 'Token is invalid'}), 401
+        except Exception as e:
+            return jsonify({'message': str(e)}), 401
         return f(current_user, *args, **kwargs)
     return decorated
 
@@ -94,31 +86,23 @@ def token_required(f):
 class Ship24API:
     def __init__(self):
         self.api_key = SHIP24_API_KEY
-        self.base_url = "https://api.ship24.com/public/v1 "  # Fixed URL
+        self.base_url = "https://api.ship24.com/public/v1 "
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
 
     def track_shipment(self, tracking_number):
-        try:
-            url = f"{self.base_url}/trackers/track"
-            payload = {"trackingNumber": tracking_number}
-            response = requests.post(url, json=payload, headers=self.headers)
-            return response.json() if response.status_code == 200 else None
-        except Exception as e:
-            app.logger.error(f"Ship24 API Error: {e}")
-            return None
+        url = f"{self.base_url}/trackers/track"
+        payload = {"trackingNumber": tracking_number}
+        response = requests.post(url, json=payload, headers=self.headers)
+        return response.json() if response.status_code == 200 else None
 
     def get_tracking_info(self, tracking_number):
-        try:
-            url = f"{self.base_url}/trackers/search"
-            params = {"trackingNumbers": tracking_number}
-            response = requests.get(url, params=params, headers=self.headers)
-            return response.json() if response.status_code == 200 else None
-        except Exception as e:
-            app.logger.error(f"Ship24 API Error: {e}")
-            return None
+        url = f"{self.base_url}/trackers/search"
+        params = {"trackingNumbers": tracking_number}
+        response = requests.get(url, params=params, headers=self.headers)
+        return response.json() if response.status_code == 200 else None
 
 ship24 = Ship24API()
 
@@ -128,7 +112,7 @@ class LogisticsAI:
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
     def generate_response(self, user_message, user_shipments=None, context=None):
-        system_prompt = """You are a helpful AI assistant for a logistics company..."""
+        system_prompt = """You are a helpful AI assistant for a logistics company."""
         if user_shipments:
             system_prompt += f"\nUser's current shipments: {user_shipments}"
         if context:
@@ -149,94 +133,28 @@ class LogisticsAI:
 
 ai_assistant = LogisticsAI()
 
-# Email Processing
-class EmailProcessor:
-    def __init__(self):
-        self.imap_server = app.config['IMAP_SERVER']
-        self.email_user = app.config['MAIL_USERNAME']
-        self.email_pass = app.config['MAIL_PASSWORD']
-
-    def extract_tracking_numbers(self, text):
-        patterns = [
-            r'\b1Z[0-9A-Z]{16}\b',  # UPS
-            r'\b\d{12}\b',          # FedEx
-            r'\b9[0-9]{21}\b',      # USPS
-            r'\b[A-Z]{2}[0-9]{9}[A-Z]{2}\b',  # DHL
-        ]
-        tracking_numbers = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            tracking_numbers.extend(matches)
-        return list(set(tracking_numbers))
-
-    def process_shipment_email(self, email_content, user_email):
-        try:
-            tracking_numbers = self.extract_tracking_numbers(email_content)
-            user = User.query.filter_by(email=user_email).first()
-            if not user:
-                return False
-            for tracking_num in tracking_numbers:
-                existing = Shipment.query.filter_by(tracking_number=tracking_num, user_id=user.id).first()
-                if not existing:
-                    tracking_info = ship24.get_tracking_info(tracking_num)
-                    shipment = Shipment(
-                        tracking_number=tracking_num,
-                        carrier=tracking_info.get('carrier') if tracking_info else 'Unknown',
-                        status='Processing',
-                        user_id=user.id
-                    )
-                    db.session.add(shipment)
-            db.session.commit()
-            return True
-        except Exception as e:
-            app.logger.error(f"Email processing error: {e}")
-            return False
-
-    def monitor_emails(self):
-        try:
-            mail = imaplib.IMAP4_SSL(self.imap_server)
-            mail.login(self.email_user, self.email_pass)
-            mail.select('inbox')
-            status, messages = mail.search(None, 'UNSEEN')
-            for msg_id in messages[0].split():
-                status, msg_data = mail.fetch(msg_id, '(RFC822)')
-                email_msg = email.message_from_bytes(msg_data[0][1])
-                content = ""
-                if email_msg.is_multipart():
-                    for part in email_msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            content = part.get_payload(decode=True).decode()
-                            break
-                else:
-                    content = email_msg.get_payload(decode=True).decode()
-                sender = email_msg['From']
-                self.process_shipment_email(content, sender)
-                mail.store(msg_id, '+FLAGS', '\\Seen')
-            mail.close()
-            mail.logout()
-        except Exception as e:
-            app.logger.error(f"Email monitoring error: {e}")
-
-email_processor = EmailProcessor()
-
 # Routes
 @app.route('/api/register', methods=['POST'])
 @cross_origin()
 def register():
     try:
         data = request.get_json()
-        if not data:
+        if not 
             return jsonify({'message': 'No JSON payload received'}), 400
+
         username = data.get('username')
         email = data.get('email')
         password = data.get('password')
         company_name = data.get("company_name")
+
         if not all([username, email, password]):
             return jsonify({'message': 'Username, email, and password are required'}), 400
+
         if User.query.filter_by(username=username).first():
             return jsonify({'message': 'Username already exists'}), 400
         if User.query.filter_by(email=email).first():
             return jsonify({'message': 'Email already exists'}), 400
+
         user = User(
             username=username,
             email=email,
@@ -245,7 +163,9 @@ def register():
         )
         db.session.add(user)
         db.session.commit()
+
         return jsonify({'message': 'User created successfully'}), 201
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'details': str(e)}), 500
@@ -333,28 +253,26 @@ def create_tables_once():
     if not tables_created:
         try:
             db.create_all()
-            app.logger.info("Database tables created successfully")
+            print("Database tables created successfully")
             tables_created = True
         except Exception as e:
-            app.logger.error(f"Error creating database tables: {str(e)}")
+            print(f"Error creating database tables: {str(e)}")
 
 # Background email monitoring
 def start_email_monitoring():
     def monitor():
         while True:
             try:
-                email_processor.monitor_emails()
+                # Simulate email monitoring
                 time.sleep(60)
             except Exception as e:
-                app.logger.error(f"Email monitoring error: {e}")
+                print(f"Email monitoring error: {e}")
                 time.sleep(300)
-    if app.config['MAIL_USERNAME'] and app.config['MAIL_PASSWORD']:
-        monitor_thread = threading.Thread(target=monitor, daemon=True)
-        monitor_thread.start()
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    if os.environ.get('FLASK_ENV') != 'development':
-        start_email_monitoring()
+    start_email_monitoring()
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
