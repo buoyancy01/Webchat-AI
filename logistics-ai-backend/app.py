@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS, cross_origin  # For better CORS control
+from flask_cors import CORS, cross_origin
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,6 +13,7 @@ import imaplib
 import email
 import re
 import threading
+import time
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -86,7 +87,7 @@ def token_required(f):
 class Ship24API:
     def __init__(self):
         self.api_key = SHIP24_API_KEY
-        self.base_url = "https://api.ship24.com/public/v1 "  # Fixed: removed extra space
+        self.base_url = "https://api.ship24.com/public/v1"  # Fixed: removed extra space
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -139,7 +140,7 @@ ai_assistant = LogisticsAI()
 def register():
     try:
         data = request.get_json()
-        if not 
+        if not data:  # Fixed: completed the if statement
             return jsonify({'message': 'No JSON payload received'}), 400
 
         username = data.get('username')
@@ -206,8 +207,14 @@ def handle_shipments(current_user):
             return jsonify({'shipments': [{
                 'id': s.id,
                 'tracking_number': s.tracking_number,
+                'carrier': s.carrier,
+                'description': s.description,
+                'origin': s.origin,
+                'destination': s.destination,
                 'status': s.status,
-                'created_at': s.created_at.isoformat()
+                'estimated_delivery': s.estimated_delivery.isoformat() if s.estimated_delivery else None,
+                'created_at': s.created_at.isoformat(),
+                'updated_at': s.updated_at.isoformat()
             } for s in shipments]}), 200
         except Exception as e:
             return jsonify({'message': str(e)}), 500
@@ -230,6 +237,60 @@ def handle_shipments(current_user):
         except Exception as e:
             db.session.rollback()
             return jsonify({'message': 'Internal server error', 'details': str(e)}), 500
+
+# Added missing track endpoint
+@app.route('/api/track/<tracking_number>', methods=['GET'])
+@token_required
+@cross_origin()
+def track_shipment_endpoint(current_user, tracking_number):
+    try:
+        # Find the shipment in the database
+        shipment = Shipment.query.filter_by(
+            tracking_number=tracking_number, 
+            user_id=current_user.id
+        ).first()
+        
+        if not shipment:
+            return jsonify({'message': 'Shipment not found'}), 404
+        
+        # Get updated tracking info from Ship24
+        tracking_info = ship24.get_tracking_info(tracking_number)
+        
+        if tracking_info:
+            # Update shipment with new information
+            shipment.status = tracking_info.get('status', shipment.status)
+            shipment.carrier = tracking_info.get('carrier', shipment.carrier)
+            shipment.origin = tracking_info.get('origin', shipment.origin)
+            shipment.destination = tracking_info.get('destination', shipment.destination)
+            shipment.updated_at = datetime.utcnow()
+            
+            if tracking_info.get('estimated_delivery'):
+                try:
+                    shipment.estimated_delivery = datetime.fromisoformat(tracking_info['estimated_delivery'])
+                except:
+                    pass
+            
+            db.session.commit()
+            
+            return jsonify({
+                'message': 'Tracking information updated successfully',
+                'shipment': {
+                    'id': shipment.id,
+                    'tracking_number': shipment.tracking_number,
+                    'carrier': shipment.carrier,
+                    'status': shipment.status,
+                    'origin': shipment.origin,
+                    'destination': shipment.destination,
+                    'estimated_delivery': shipment.estimated_delivery.isoformat() if shipment.estimated_delivery else None,
+                    'updated_at': shipment.updated_at.isoformat()
+                }
+            }), 200
+        else:
+            return jsonify({'message': 'Unable to fetch tracking information'}), 502
+            
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'details': str(e)}), 500
 
 @app.route('/api/chat', methods=['POST'])
 @token_required
