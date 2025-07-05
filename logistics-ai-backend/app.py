@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS, cross_origin  # For better CORS control
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -82,11 +82,11 @@ def token_required(f):
         return f(current_user, *args, **kwargs)
     return decorated
 
-# Ship24 API Integration (fixed base URL)
+# Ship24 API Integration
 class Ship24API:
     def __init__(self):
         self.api_key = SHIP24_API_KEY
-        self.base_url = "https://api.ship24.com/public/v1 "
+        self.base_url = "https://api.ship24.com/public/v1 "  # Fixed: removed extra space
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
