@@ -71,6 +71,20 @@ class Shipment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    
+    def serialize(self):
+        return {
+            "id": self.id,
+            "tracking_number": self.tracking_number,
+            "carrier": self.carrier,
+            "description": self.description,
+            "origin": self.origin,
+            "destination": self.destination,
+            "status": self.status,
+            "estimated_delivery": self.estimated_delivery.isoformat() if self.estimated_delivery else None,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
 
 # JWT Token decorator (skips OPTIONS requests)
 def token_required(f):
@@ -94,23 +108,60 @@ def token_required(f):
         return f(current_user, *args, **kwargs)
     return decorated
 
-# Ship24 API Integration
+# Ship24 API Integration with updated endpoint and response parsing
 class Ship24API:
     def __init__(self):
         self.api_key = SHIP24_API_KEY
-        self.base_url = "https://api.ship24.com/public/v1"  # Fixed: removed extra space
+        self.base_url = "https://api.ship24.com/public/v1"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+    
+    def _parse_ship24_response(self, api_response):
+        try:
+            if not api_response or not api_response.get('data'):
+                return None
+                
+            trackings = api_response['data'].get('trackings', [])
+            if not trackings:
+                return None
+                
+            # Get the first tracking result
+            shipment_track = trackings[0].get('shipmentTrack', [{}])[0]
+            
+            # Extract carrier and status
+            carrier = shipment_track.get('carrier', {}).get('name', 'Unknown')
+            status = shipment_track.get('status', 'Unknown')
+            
+            # Extract origin/destination
+            origin_addr = shipment_track.get('shipment', {}).get('origin', {}).get('address', {})
+            origin = f"{origin_addr.get('city', '')}, {origin_addr.get('country', '')}" if origin_addr else None
+            
+            dest_addr = shipment_track.get('shipment', {}).get('destination', {}).get('address', {})
+            destination = f"{dest_addr.get('city', '')}, {dest_addr.get('country', '')}" if dest_addr else None
+            
+            # Extract estimated delivery
+            estimated_delivery = shipment_track.get('shipment', {}).get('estimatedDeliveryDate')
+            
+            return {
+                "carrier": carrier,
+                "status": status,
+                "origin": origin,
+                "destination": destination,
+                "estimated_delivery": estimated_delivery
+            }
+        except Exception as e:
+            logger.error(f"Error parsing Ship24 response: {e}")
+            return None
 
     def track_shipment(self, tracking_number):
-        logger.info(f"Attempting to track shipment: {tracking_number} via Ship24 API.")
+        logger.info(f"Tracking shipment: {tracking_number} via Ship24 API.")
         url = f"{self.base_url}/trackers/track"
         payload = {"trackingNumber": tracking_number}
         try:
             response = requests.post(url, json=payload, headers=self.headers)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            response.raise_for_status()
             logger.info(f"Ship24 track_shipment response: {response.status_code}")
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -118,16 +169,16 @@ class Ship24API:
             return None
 
     def get_tracking_info(self, tracking_number):
-        logger.info(f"Attempting to get tracking info for: {tracking_number} via Ship24 API.")
-        url = f"{self.base_url}/trackers/search"
-        params = {"trackingNumbers": tracking_number}
+        logger.info(f"Fetching tracking info for: {tracking_number}")
+        url = f"{self.base_url}/trackers/results"
+        params = {"trackingNumber": tracking_number}
         try:
             response = requests.get(url, params=params, headers=self.headers)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            logger.info(f"Ship24 get_tracking_info response: {response.status_code}")
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting tracking info for {tracking_number} with Ship24: {e}")
+            response.raise_for_status()
+            json_data = response.json()
+            return self._parse_ship24_response(json_data)
+        except Exception as e:
+            logger.error(f"Ship24 API error: {e}")
             return None
 
 ship24 = Ship24API()
@@ -168,7 +219,7 @@ def register():
     logger.info("Register endpoint called.")
     try:
         data = request.get_json()
-        if not data:  # Fixed: completed the if statement
+        if not data:
             logger.warning("Register: No JSON payload received.")
             return jsonify({"message": "No JSON payload received"}), 400
 
@@ -244,150 +295,144 @@ def handle_shipments(current_user):
         try:
             shipments = Shipment.query.filter_by(user_id=current_user.id).all()
             logger.info(f"Retrieved {len(shipments)} shipments for user {current_user.username}.")
-            return jsonify({"shipments": [{
-                "id": s.id,
-                "tracking_number": s.tracking_number,
-                "carrier": s.carrier,
-                "description": s.description,
-                "origin": s.origin,
-                "destination": s.destination,
-                "status": s.status,
-                "estimated_delivery": s.estimated_delivery.isoformat() if s.estimated_delivery else None,
-                "created_at": s.created_at.isoformat(),
-                "updated_at": s.updated_at.isoformat()
-            } for s in shipments]}), 200
+            return jsonify({"shipments": [s.serialize() for s in shipments]}), 200
         except Exception as e:
-            logger.error(f"Error retrieving shipments for user {current_user.username}: {e}")
+            logger.error(f"Error retrieving shipments: {e}")
             return jsonify({"message": str(e)}), 500
+            
     elif request.method == "POST":
         logger.info(f"POST /api/shipments called by user {current_user.username}.")
         start_time = time.time()
         try:
             data = request.get_json()
             tracking_number = data.get("tracking_number")
-            logger.info(f"Received request to add tracking number: {tracking_number}.")
+            logger.info(f"Adding shipment: {tracking_number}")
 
             if Shipment.query.filter_by(tracking_number=tracking_number, user_id=current_user.id).first():
-                logger.warning(f"Shipment {tracking_number} already exists for user {current_user.username}.")
+                logger.warning(f"Shipment {tracking_number} already exists")
                 return jsonify({"message": "Shipment already exists"}), 400
             
-            # Step 1: Call Ship24 API
+            # Get tracking info from Ship24
             ship24_api_start_time = time.time()
             tracking_info = ship24.get_tracking_info(tracking_number)
             ship24_api_end_time = time.time()
-            logger.info(f"Ship24 API call for {tracking_number} took {ship24_api_end_time - ship24_api_start_time:.4f} seconds.")
-
+            logger.info(f"Ship24 API call took {ship24_api_end_time - ship24_api_start_time:.4f}s")
+            
             if not tracking_info:
-                logger.error(f"Failed to get tracking info from Ship24 for {tracking_number}.")
-                return jsonify({"message": "Failed to retrieve tracking information from Ship24"}), 500
+                logger.error(f"Failed to get tracking info for {tracking_number}")
+                return jsonify({"message": "Failed to retrieve tracking information"}), 500
 
-            # Step 2: Create Shipment object and add to DB
+            # Parse estimated delivery date
+            estimated_delivery = None
+            if tracking_info.get("estimated_delivery"):
+                try:
+                    # Handle UTC timezone format
+                    est_delivery_str = tracking_info["estimated_delivery"].replace('Z', '+00:00')
+                    estimated_delivery = datetime.fromisoformat(est_delivery_str)
+                except Exception as e:
+                    logger.warning(f"Could not parse estimated delivery: {e}")
+
+            # Create shipment with parsed data
             db_add_start_time = time.time()
             shipment = Shipment(
                 tracking_number=tracking_number,
-                carrier=tracking_info.get("carrier") if tracking_info else "Unknown",
-                status="Processing",
+                carrier=tracking_info.get("carrier", "Unknown"),
+                status=tracking_info.get("status", "Pending"),
+                origin=tracking_info.get("origin"),
+                destination=tracking_info.get("destination"),
+                estimated_delivery=estimated_delivery,
                 user_id=current_user.id
             )
             db.session.add(shipment)
             db.session.commit()
             db_add_end_time = time.time()
-            logger.info(f"Database add and commit for {tracking_number} took {db_add_end_time - db_add_start_time:.4f} seconds.")
+            logger.info(f"DB commit took {db_add_end_time - db_add_start_time:.4f}s")
 
             end_time = time.time()
-            logger.info(f"Total time to add shipment {tracking_number}: {end_time - start_time:.4f} seconds.")
-            return jsonify({"message": "Shipment added successfully"}), 201
+            logger.info(f"Total time to add shipment: {end_time - start_time:.4f}s")
+            return jsonify({
+                "message": "Shipment added successfully",
+                "shipment": shipment.serialize()
+            }), 201
+            
         except Exception as e:
             db.session.rollback()
-            logger.error(f"Error adding shipment for user {current_user.username}: {e}")
+            logger.error(f"Error adding shipment: {e}")
             return jsonify({"message": "Internal server error", "details": str(e)}), 500
 
-# Added missing track endpoint
 @app.route("/api/track/<tracking_number>", methods=["GET"])
 @token_required
 @cross_origin()
 def track_shipment_endpoint(current_user, tracking_number):
-    logger.info(f"GET /api/track/{tracking_number} called by user {current_user.username}.")
+    logger.info(f"Tracking shipment: {tracking_number} for user {current_user.username}")
     try:
-        # Find the shipment in the database
-        db_query_start_time = time.time()
+        # Find shipment in database
         shipment = Shipment.query.filter_by(
             tracking_number=tracking_number,
             user_id=current_user.id
         ).first()
-        db_query_end_time = time.time()
-        logger.info(f"Database query for shipment {tracking_number} took {db_query_end_time - db_query_start_time:.4f} seconds.")
         
         if not shipment:
-            logger.warning(f"Shipment {tracking_number} not found for user {current_user.username}.")
+            logger.warning(f"Shipment {tracking_number} not found")
             return jsonify({"message": "Shipment not found"}), 404
         
-        # Get updated tracking info from Ship24
-        ship24_api_start_time = time.time()
+        # Get updated tracking info
         tracking_info = ship24.get_tracking_info(tracking_number)
-        ship24_api_end_time = time.time()
-        logger.info(f"Ship24 API call for {tracking_number} took {ship24_api_end_time - ship24_api_start_time:.4f} seconds.")
         
+        # If we get new info, update shipment
+        update_success = False
         if tracking_info:
-            # Update shipment with new information
-            db_update_start_time = time.time()
-            shipment.status = tracking_info.get("status", shipment.status)
-            shipment.carrier = tracking_info.get("carrier", shipment.carrier)
-            shipment.origin = tracking_info.get("origin", shipment.origin)
-            shipment.destination = tracking_info.get("destination", shipment.destination)
-            shipment.updated_at = datetime.utcnow()
-            
-            if tracking_info.get("estimated_delivery"):
-                try:
-                    shipment.estimated_delivery = datetime.fromisoformat(tracking_info["estimated_delivery"])
-                except:
-                    logger.warning(f"Could not parse estimated_delivery for {tracking_number}: {tracking_info['estimated_delivery']}")
-                    pass
-            
-            db.session.commit()
-            db_update_end_time = time.time()
-            logger.info(f"Database update and commit for {tracking_number} took {db_update_end_time - db_update_start_time:.4f} seconds.")
-            
-            return jsonify({
-                "message": "Tracking information updated successfully",
-                "shipment": {
-                    "id": shipment.id,
-                    "tracking_number": shipment.tracking_number,
-                    "carrier": shipment.carrier,
-                    "status": shipment.status,
-                    "origin": shipment.origin,
-                    "destination": shipment.destination,
-                    "estimated_delivery": shipment.estimated_delivery.isoformat() if shipment.estimated_delivery else None,
-                    "updated_at": shipment.updated_at.isoformat()
-                }
-            }), 200
-        else:
-            logger.error(f"Unable to fetch tracking information from Ship24 for {tracking_number}.")
-            return jsonify({"message": "Unable to fetch tracking information"}), 502
+            try:
+                # Update fields with new data
+                shipment.status = tracking_info.get("status", shipment.status)
+                shipment.carrier = tracking_info.get("carrier", shipment.carrier)
+                shipment.origin = tracking_info.get("origin", shipment.origin)
+                shipment.destination = tracking_info.get("destination", shipment.destination)
+                
+                # Update estimated delivery if available
+                if tracking_info.get("estimated_delivery"):
+                    try:
+                        est_delivery_str = tracking_info["estimated_delivery"].replace('Z', '+00:00')
+                        shipment.estimated_delivery = datetime.fromisoformat(est_delivery_str)
+                    except Exception as e:
+                        logger.warning(f"Error parsing delivery date: {e}")
+                
+                shipment.updated_at = datetime.utcnow()
+                db.session.commit()
+                update_success = True
+                logger.info(f"Shipment {tracking_number} updated successfully")
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"Error updating shipment: {e}")
+        
+        # Return updated shipment info
+        return jsonify({
+            "message": "Tracking information retrieved",
+            "updated": update_success,
+            "shipment": shipment.serialize()
+        }), 200
             
     except Exception as e:
-        db.session.rollback()
-        logger.error(f"Error in track_shipment_endpoint for {tracking_number}: {e}")
+        logger.error(f"Tracking error: {e}")
         return jsonify({"message": "Internal server error", "details": str(e)}), 500
 
 @app.route("/api/chat", methods=["POST"])
 @token_required
 @cross_origin()
 def chat(current_user):
-    logger.info(f"POST /api/chat called by user {current_user.username}.")
+    logger.info(f"Chat request from user {current_user.username}")
     try:
         data = request.get_json()
         message = data.get("message")
         shipments = Shipment.query.filter_by(user_id=current_user.id).all()
         shipments_context = [f"{s.tracking_number} ({s.status})" for s in shipments]
         ai_response = ai_assistant.generate_response(message, shipments_context)
-        logger.info("AI chat response sent.")
         return jsonify({"response": ai_response}), 200
     except Exception as e:
-        logger.error(f"Error in chat endpoint for user {current_user.username}: {e}")
+        logger.error(f"Chat error: {e}")
         return jsonify({"message": str(e)}), 500
 
-# Fix for Flask v2.3+ (no before_first_request)
+# Database initialization
 tables_created = False
 @app.before_request
 def create_tables_once():
@@ -395,28 +440,33 @@ def create_tables_once():
     if not tables_created:
         try:
             db.create_all()
-            logger.info("Database tables created successfully.")
+            logger.info("Database tables created")
             tables_created = True
         except Exception as e:
-            logger.error(f"Error creating database tables: {str(e)}")
+            logger.error(f"Error creating tables: {str(e)}")
 
 # Background email monitoring
 def start_email_monitoring():
     def monitor():
         while True:
             try:
-                logger.info("Email monitoring thread started.")
-                # Simulate email monitoring
-                time.sleep(60)
+                logger.info("Email monitoring active")
+                # Actual implementation would go here
+                time.sleep(300)  # Check every 5 minutes
             except Exception as e:
                 logger.error(f"Email monitoring error: {e}")
-                time.sleep(300)
+                time.sleep(600)
     monitor_thread = threading.Thread(target=monitor, daemon=True)
     monitor_thread.start()
 
 if __name__ == "__main__":
+    # Validate API keys on startup
+    if not SHIP24_API_KEY:
+        logger.warning("SHIP24_API_KEY not set - tracking will fail")
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY not set - AI features will fail")
+    
     with app.app_context():
         db.create_all()
     start_email_monitoring()
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
