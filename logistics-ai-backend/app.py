@@ -108,7 +108,7 @@ def token_required(f):
         return f(current_user, *args, **kwargs)
     return decorated
 
-# Ship24 API Integration with updated endpoint and response parsing
+# FIXED Ship24 API Integration - Updated with correct endpoints and error handling
 class Ship24API:
     def __init__(self):
         self.api_key = SHIP24_API_KEY
@@ -117,14 +117,21 @@ class Ship24API:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        
+        # Validate API key on initialization
+        if not self.api_key:
+            logger.error("SHIP24_API_KEY not set - tracking will fail")
     
     def _parse_ship24_response(self, api_response):
+        """Parse Ship24 API response and extract tracking information"""
         try:
             if not api_response or not api_response.get('data'):
+                logger.warning("No data in Ship24 response")
                 return None
                 
             trackings = api_response['data'].get('trackings', [])
             if not trackings:
+                logger.warning("No trackings found in Ship24 response")
                 return None
                 
             # Get the first tracking result
@@ -156,30 +163,89 @@ class Ship24API:
             return None
 
     def track_shipment(self, tracking_number):
+        """
+        Create tracker and get tracking results in one call.
+        Enhanced with better error handling and timeout.
+        """
         logger.info(f"Tracking shipment: {tracking_number} via Ship24 API.")
         url = f"{self.base_url}/trackers/track"
         payload = {"trackingNumber": tracking_number}
+        
         try:
-            response = requests.post(url, json=payload, headers=self.headers)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
             response.raise_for_status()
             logger.info(f"Ship24 track_shipment response: {response.status_code}")
             return response.json()
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.error(f"Ship24 API: Tracking number {tracking_number} not found")
+            elif e.response.status_code == 401:
+                logger.error("Ship24 API: Invalid API key or authentication failed")
+            elif e.response.status_code == 422:
+                logger.error(f"Ship24 API: Invalid tracking number format: {tracking_number}")
+            else:
+                logger.error(f"Ship24 API HTTP error {e.response.status_code}: {e}")
+            return None
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"Ship24 API timeout for tracking number: {tracking_number}")
+            return None
+            
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error tracking shipment {tracking_number} with Ship24: {e}")
+            logger.error(f"Ship24 API network error: {e}")
             return None
 
     def get_tracking_info(self, tracking_number):
+        """
+        FIXED METHOD: Uses the correct Ship24 API approach.
+        Instead of using the non-existent /trackers/results endpoint,
+        this reuses the track_shipment method which uses the correct endpoint.
+        """
         logger.info(f"Fetching tracking info for: {tracking_number}")
-        url = f"{self.base_url}/trackers/results"
-        params = {"trackingNumber": tracking_number}
+        
         try:
-            response = requests.get(url, params=params, headers=self.headers)
-            response.raise_for_status()
-            json_data = response.json()
-            return self._parse_ship24_response(json_data)
+            # Use the track_shipment method which calls the correct endpoint
+            api_response = self.track_shipment(tracking_number)
+            
+            # Handle None response (error cases)
+            if api_response is None:
+                logger.error(f"Failed to get tracking info for {tracking_number}")
+                return None
+            
+            # Parse the successful response
+            parsed_data = self._parse_ship24_response(api_response)
+            if parsed_data:
+                logger.info(f"Successfully retrieved tracking info for {tracking_number}")
+            else:
+                logger.warning(f"No tracking data found for {tracking_number}")
+                
+            return parsed_data
+            
         except Exception as e:
-            logger.error(f"Ship24 API error: {e}")
+            logger.error(f"Unexpected error getting tracking info for {tracking_number}: {e}")
             return None
+
+    def validate_api_key(self):
+        """Test if the API key is valid by making a simple request"""
+        if not self.api_key:
+            return False
+            
+        url = f"{self.base_url}/couriers"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                logger.info("Ship24 API key validation successful")
+                return True
+            elif response.status_code == 401:
+                logger.error("Ship24 API key validation failed: Invalid key")
+                return False
+            else:
+                logger.warning(f"Ship24 API key validation returned {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"Error validating Ship24 API key: {e}")
+            return False
 
 ship24 = Ship24API()
 
@@ -312,7 +378,7 @@ def handle_shipments(current_user):
                 logger.warning(f"Shipment {tracking_number} already exists")
                 return jsonify({"message": "Shipment already exists"}), 400
             
-            # Get tracking info from Ship24
+            # Get tracking info from Ship24 (now using the fixed method)
             ship24_api_start_time = time.time()
             tracking_info = ship24.get_tracking_info(tracking_number)
             ship24_api_end_time = time.time()
@@ -376,7 +442,7 @@ def track_shipment_endpoint(current_user, tracking_number):
             logger.warning(f"Shipment {tracking_number} not found")
             return jsonify({"message": "Shipment not found"}), 404
         
-        # Get updated tracking info
+        # Get updated tracking info (now using the fixed method)
         tracking_info = ship24.get_tracking_info(tracking_number)
         
         # If we get new info, update shipment
@@ -460,9 +526,16 @@ def start_email_monitoring():
     monitor_thread.start()
 
 if __name__ == "__main__":
-    # Validate API keys on startup
+    # Enhanced API key validation on startup
     if not SHIP24_API_KEY:
         logger.warning("SHIP24_API_KEY not set - tracking will fail")
+    else:
+        # Test API key validity on startup
+        if ship24.validate_api_key():
+            logger.info("Ship24 API key validated successfully")
+        else:
+            logger.error("Ship24 API key validation failed")
+            
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY not set - AI features will fail")
     
