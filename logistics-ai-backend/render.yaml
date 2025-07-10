@@ -16,7 +16,7 @@ services:
           property: connectionString
       - key: OPENAI_API_KEY
         sync: false
-      - key: SHIP24_API_KEY
+      - key: SHIPENGINE_API_KEY
         sync: false
       - key: MAIL_SERVER
         value: smtp.gmail.com
