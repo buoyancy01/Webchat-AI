@@ -92,6 +92,29 @@ export const api = {
     });
     return handleApiResponse(response);
   },
+
+  // Conversations
+  getConversations: async (token: string, page = 1, perPage = 20) => {
+    const response = await fetch(`${API_BASE_URL}/api/conversations?page=${page}&per_page=${perPage}`, {
+      headers: getAuthHeaders(token),
+    });
+    return handleApiResponse(response);
+  },
+
+  clearConversations: async (token: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/conversations/clear`, {
+      method: 'POST',
+      headers: getAuthHeaders(token),
+    });
+    return handleApiResponse(response);
+  },
+
+  getConversationStats: async (token: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/conversations/stats`, {
+      headers: getAuthHeaders(token),
+    });
+    return handleApiResponse(response);
+  },
 };
 
 export default api;
