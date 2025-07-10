@@ -5,7 +5,6 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
-import { Separator } from '@/components/ui/separator';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { 
   Package, 
@@ -170,7 +169,6 @@ export default function Dashboard() {
     }
     
     console.log(`Updating ${activeShipments.length} active shipments`);
-    setConnectionStatus('updating');
     
     const updatePromises = activeShipments.map(async (shipment) => {
       try {
@@ -385,7 +383,6 @@ export default function Dashboard() {
   };
   
   const renderEnhancedProgressBar = (shipment: Shipment) => {
-    const stages = getShipmentStages(shipment);
     const progress = getStatusProgress(shipment.status);
     
     return (
@@ -449,6 +446,8 @@ export default function Dashboard() {
       </div>
     );
   };
+
+  const getShipmentStages = (shipment: Shipment): ShipmentStage[] => {
     const currentStatus = shipment.status?.toLowerCase() || 'unknown';
     
     const stages: ShipmentStage[] = [
@@ -567,7 +566,7 @@ export default function Dashboard() {
         <h4 className="text-sm font-medium text-gray-700 mb-3">Shipment Timeline</h4>
         <div className="space-y-3">
           {stages.map((stage, index) => (
-            <div key={stage.id} className="flex items-center space-x-3">
+            <div key={stage.id} className="flex items-center space-x-3 relative">
               {/* Stage Icon */}
               <div className={`flex-shrink-0 w-8 h-8 rounded-full border-2 flex items-center justify-center ${
                 stage.completed ? 'bg-green-100 border-green-500 text-green-700' :
