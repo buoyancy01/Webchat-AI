@@ -60,6 +60,7 @@ class User(db.Model):
     company_name = db.Column(db.String(120), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     shipments = db.relationship("Shipment", backref="user", lazy=True)
+    conversations = db.relationship("Conversation", backref="user", lazy=True)
 
 class Shipment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -86,6 +87,24 @@ class Shipment(db.Model):
             "estimated_delivery": self.estimated_delivery.isoformat() if self.estimated_delivery else None,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat()
+        }
+
+class Conversation(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_message = db.Column(db.Text, nullable=False)
+    ai_response = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    # Optional: Track shipment context when message was sent
+    shipment_context = db.Column(db.JSON, nullable=True)  # Store shipment data at time of conversation
+    
+    def serialize(self):
+        return {
+            "id": self.id,
+            "user_message": self.user_message,
+            "ai_response": self.ai_response,
+            "timestamp": self.timestamp.isoformat(),
+            "shipment_context": self.shipment_context
         }
 
 # JWT Token decorator (skips OPTIONS requests)
@@ -396,7 +415,7 @@ class LogisticsAI:
     def __init__(self):
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-    def generate_response(self, user_message, user_shipments=None, context=None):
+    def generate_response(self, user_message, user_shipments=None, context=None, conversation_history=None):
         system_prompt = """You are LogisticsAI, a specialized AI assistant for logistics and shipment tracking services. Your primary role is to help users with:
 
 1. **Shipment Tracking**: Help users understand their shipment statuses, delivery estimates, and tracking information
@@ -409,21 +428,36 @@ Key Guidelines:
 - Be helpful, professional, and solution-oriented
 - If asked about non-logistics topics, politely redirect the conversation back to shipping and logistics services
 - Use the user's shipment data to provide personalized assistance
+- Remember previous conversations to provide contextual responses
+- Reference specific shipment details when relevant
 - Provide actionable advice and clear explanations
 - Be empathetic when dealing with delivery issues or concerns
 
 Always prioritize helping users with their shipping and logistics needs."""
+        
+        # Add current shipment information
         if user_shipments:
             system_prompt += f"\n\nUser's current shipments: {user_shipments}"
+        
+        # Add additional context
         if context:
             system_prompt += f"\nAdditional context: {context}"
+        
+        # Build conversation messages including history
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add conversation history if available
+        if conversation_history:
+            for conv in conversation_history[-5:]:  # Last 5 conversations for context
+                messages.append({"role": "user", "content": conv['user_message']})
+                messages.append({"role": "assistant", "content": conv['ai_response']})
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
         try:
             response = self.client.chat.completions.create(
                 model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
+                messages=messages,
                 max_tokens=500,
                 temperature=0.7
             )
@@ -741,12 +775,148 @@ def chat(current_user):
     try:
         data = request.get_json()
         message = data.get("message")
+        
+        if not message:
+            return jsonify({"message": "Message is required"}), 400
+        
+        # Get user's current shipments with detailed information
         shipments = Shipment.query.filter_by(user_id=current_user.id).all()
-        shipments_context = [f"{s.tracking_number} ({s.status})" for s in shipments]
-        ai_response = ai_assistant.generate_response(message, shipments_context)
-        return jsonify({"response": ai_response}), 200
+        
+        # Create detailed shipment context
+        shipments_context = []
+        shipment_data = {}
+        for s in shipments:
+            status_info = f"Tracking: {s.tracking_number}, Carrier: {s.carrier or 'Unknown'}, Status: {s.status or 'Unknown'}"
+            if s.origin:
+                status_info += f", From: {s.origin}"
+            if s.destination:
+                status_info += f", To: {s.destination}"
+            if s.estimated_delivery:
+                status_info += f", Est. Delivery: {s.estimated_delivery.strftime('%Y-%m-%d')}"
+            
+            shipments_context.append(status_info)
+            shipment_data[s.tracking_number] = s.serialize()
+        
+        # Retrieve recent conversation history (last 10 conversations)
+        conversation_history = Conversation.query.filter_by(user_id=current_user.id) \
+            .order_by(Conversation.timestamp.desc()) \
+            .limit(10) \
+            .all()
+        
+        # Convert to format expected by AI
+        history_data = []
+        for conv in reversed(conversation_history):  # Reverse to get chronological order
+            history_data.append({
+                'user_message': conv.user_message,
+                'ai_response': conv.ai_response,
+                'timestamp': conv.timestamp.isoformat()
+            })
+        
+        # Generate AI response with conversation history and shipment context
+        ai_response = ai_assistant.generate_response(
+            message, 
+            shipments_context, 
+            conversation_history=history_data
+        )
+        
+        # Save conversation to database
+        conversation = Conversation(
+            user_message=message,
+            ai_response=ai_response,
+            user_id=current_user.id,
+            shipment_context=shipment_data  # Store current shipment state
+        )
+        db.session.add(conversation)
+        db.session.commit()
+        
+        logger.info(f"Conversation saved for user {current_user.username}")
+        
+        return jsonify({
+            "response": ai_response,
+            "conversation_id": conversation.id,
+            "shipments_count": len(shipments)
+        }), 200
+        
     except Exception as e:
+        db.session.rollback()
         logger.error(f"Chat error: {e}")
+        return jsonify({"message": str(e)}), 500
+
+@app.route("/api/conversations", methods=["GET"])
+@token_required
+@cross_origin()
+def get_conversations(current_user):
+    """Get conversation history for the current user"""
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = min(request.args.get('per_page', 20, type=int), 100)  # Max 100 per page
+        
+        conversations = Conversation.query.filter_by(user_id=current_user.id) \
+            .order_by(Conversation.timestamp.desc()) \
+            .paginate(page=page, per_page=per_page, error_out=False)
+        
+        return jsonify({
+            "conversations": [conv.serialize() for conv in conversations.items],
+            "total": conversations.total,
+            "page": page,
+            "per_page": per_page,
+            "has_more": conversations.has_next
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting conversations: {e}")
+        return jsonify({"message": str(e)}), 500
+
+@app.route("/api/conversations/clear", methods=["POST"])
+@token_required
+@cross_origin()
+def clear_conversations(current_user):
+    """Clear all conversation history for the current user"""
+    try:
+        deleted_count = Conversation.query.filter_by(user_id=current_user.id).delete()
+        db.session.commit()
+        
+        logger.info(f"Cleared {deleted_count} conversations for user {current_user.username}")
+        
+        return jsonify({
+            "message": "Conversation history cleared successfully",
+            "deleted_count": deleted_count
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error clearing conversations: {e}")
+        return jsonify({"message": str(e)}), 500
+
+@app.route("/api/conversations/stats", methods=["GET"])
+@token_required
+@cross_origin()
+def get_conversation_stats(current_user):
+    """Get conversation statistics for the current user"""
+    try:
+        total_conversations = Conversation.query.filter_by(user_id=current_user.id).count()
+        
+        # Get recent conversation (last 7 days)
+        from datetime import timedelta
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        recent_conversations = Conversation.query.filter(
+            Conversation.user_id == current_user.id,
+            Conversation.timestamp >= week_ago
+        ).count()
+        
+        # Get latest conversation
+        latest_conversation = Conversation.query.filter_by(user_id=current_user.id) \
+            .order_by(Conversation.timestamp.desc()) \
+            .first()
+        
+        return jsonify({
+            "total_conversations": total_conversations,
+            "recent_conversations": recent_conversations,
+            "latest_conversation": latest_conversation.serialize() if latest_conversation else None
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting conversation stats: {e}")
         return jsonify({"message": str(e)}), 500
 
 # Database initialization
