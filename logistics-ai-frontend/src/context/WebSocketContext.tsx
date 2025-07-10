@@ -44,27 +44,37 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const maxReconnectAttempts = 5;
 
   const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000';
-  const WS_URL = API_BASE_URL.replace(/^http/, 'ws').replace(/^https/, 'wss');
+  // Flask-SocketIO runs on the same port as the HTTP server, no need to convert to ws://
 
   const connect = () => {
     if (!isAuthenticated || !token) {
       console.log('Not authenticated, skipping WebSocket connection');
+      setConnectionStatus('disconnected');
       return;
     }
 
-    console.log('Connecting to WebSocket...', WS_URL);
+    // Validate token format
+    if (!token.startsWith('Bearer ') && !token.includes('.')) {
+      console.error('Invalid token format for WebSocket connection');
+      setConnectionStatus('error');
+      return;
+    }
+
+    console.log('Connecting to WebSocket...', API_BASE_URL);
+    console.log('Using token:', token.substring(0, 20) + '...');
     setConnectionStatus('connecting');
 
-    const newSocket = io(WS_URL, {
+    const newSocket = io(API_BASE_URL, {
       auth: {
         token: token
       },
-      transports: ['websocket', 'polling'],
-      timeout: 10000,
+      transports: ['polling', 'websocket'], // Try polling first, then websocket
+      timeout: 20000, // Increase timeout
       reconnection: true,
       reconnectionAttempts: maxReconnectAttempts,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
+      reconnectionDelay: 2000, // Increase initial delay
+      reconnectionDelayMax: 10000, // Increase max delay
+      forceNew: true, // Force a new connection
     });
 
     // Connection events
@@ -90,15 +100,21 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     });
 
     newSocket.on('connect_error', (error) => {
-      console.error('WebSocket connection error:', error);
+      console.error('WebSocket connection error:', error.message || error);
       setIsConnected(false);
       setConnectionStatus('error');
       
       reconnectAttemptsRef.current++;
+      console.log(`Connection attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts} failed`);
+      
       if (reconnectAttemptsRef.current < maxReconnectAttempts) {
         scheduleReconnect();
       } else {
-        toast.error('Failed to connect to real-time updates. Please refresh the page.');
+        console.error('Max reconnection attempts reached');
+        toast.error('Failed to connect to real-time updates. Please refresh the page.', {
+          id: 'websocket-error', // Prevent duplicate toasts
+          duration: 10000
+        });
       }
     });
 
