@@ -75,6 +75,14 @@ export const api = {
     return handleApiResponse(response);
   },
 
+  refreshShipments: async (token: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/refresh-shipments`, {
+      method: 'POST',
+      headers: getAuthHeaders(token),
+    });
+    return handleApiResponse(response);
+  },
+
   // Chat
   sendChatMessage: async (token: string, message: string) => {
     const response = await fetch(`${API_BASE_URL}/api/chat`, {
