@@ -1,1 +1,213 @@
-import React, { createContext, useContext, useEffect, useState, useRef } from 'react';\nimport { io, Socket } from 'socket.io-client';\nimport { useAuth } from './AuthContext';\nimport { toast } from 'sonner';\n\ninterface WebSocketContextType {\n  socket: Socket | null;\n  isConnected: boolean;\n  connectionStatus: 'connecting' | 'connected' | 'disconnected' | 'error';\n  lastUpdate: Date | null;\n}\n\nconst WebSocketContext = createContext<WebSocketContextType>({\n  socket: null,\n  isConnected: false,\n  connectionStatus: 'disconnected',\n  lastUpdate: null\n});\n\nexport const useWebSocket = () => {\n  const context = useContext(WebSocketContext);\n  if (!context) {\n    throw new Error('useWebSocket must be used within a WebSocketProvider');\n  }\n  return context;\n};\n\ninterface WebSocketProviderProps {\n  children: React.ReactNode;\n  onShipmentUpdate?: (data: any) => void;\n}\n\nexport const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ \n  children, \n  onShipmentUpdate \n}) => {\n  const { token, isAuthenticated } = useAuth();\n  const [socket, setSocket] = useState<Socket | null>(null);\n  const [isConnected, setIsConnected] = useState(false);\n  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('disconnected');\n  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);\n  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);\n  const reconnectAttemptsRef = useRef(0);\n  const maxReconnectAttempts = 5;\n\n  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000';\n  const WS_URL = API_BASE_URL.replace(/^http/, 'ws').replace(/^https/, 'wss');\n\n  const connect = () => {\n    if (!isAuthenticated || !token) {\n      console.log('Not authenticated, skipping WebSocket connection');\n      return;\n    }\n\n    console.log('Connecting to WebSocket...', WS_URL);\n    setConnectionStatus('connecting');\n\n    const newSocket = io(WS_URL, {\n      auth: {\n        token: token\n      },\n      transports: ['websocket', 'polling'],\n      timeout: 10000,\n      reconnection: true,\n      reconnectionAttempts: maxReconnectAttempts,\n      reconnectionDelay: 1000,\n      reconnectionDelayMax: 5000,\n    });\n\n    // Connection events\n    newSocket.on('connect', () => {\n      console.log('WebSocket connected successfully');\n      setIsConnected(true);\n      setConnectionStatus('connected');\n      reconnectAttemptsRef.current = 0;\n      \n      // Join shipment updates room\n      newSocket.emit('join_shipment_updates', { token });\n    });\n\n    newSocket.on('disconnect', (reason) => {\n      console.log('WebSocket disconnected:', reason);\n      setIsConnected(false);\n      setConnectionStatus('disconnected');\n      \n      // Attempt reconnection if not a manual disconnect\n      if (reason !== 'io client disconnect' && reconnectAttemptsRef.current < maxReconnectAttempts) {\n        scheduleReconnect();\n      }\n    });\n\n    newSocket.on('connect_error', (error) => {\n      console.error('WebSocket connection error:', error);\n      setIsConnected(false);\n      setConnectionStatus('error');\n      \n      reconnectAttemptsRef.current++;\n      if (reconnectAttemptsRef.current < maxReconnectAttempts) {\n        scheduleReconnect();\n      } else {\n        toast.error('Failed to connect to real-time updates. Please refresh the page.');\n      }\n    });\n\n    // Application events\n    newSocket.on('connection_status', (data) => {\n      console.log('Connection status:', data);\n      setLastUpdate(new Date());\n    });\n\n    newSocket.on('shipment_update', (data) => {\n      console.log('Received shipment update:', data);\n      setLastUpdate(new Date());\n      \n      // Show notification for status changes\n      if (data.type === 'status_change') {\n        toast.success(\n          `Shipment ${data.shipment.tracking_number} status updated to ${data.shipment.status}`,\n          {\n            duration: 5000,\n            action: {\n              label: 'View',\n              onClick: () => {\n                // Could scroll to shipment or open details\n                console.log('View shipment clicked');\n              }\n            }\n          }\n        );\n      } else if (data.type === 'new_shipment') {\n        toast.info(`New shipment added: ${data.shipment.tracking_number}`);\n      }\n      \n      // Call the callback if provided\n      if (onShipmentUpdate) {\n        onShipmentUpdate(data);\n      }\n    });\n\n    newSocket.on('joined_updates', (data) => {\n      if (data.status === 'success') {\n        console.log('Successfully joined shipment updates room');\n      } else {\n        console.error('Failed to join updates room:', data.message);\n      }\n    });\n\n    setSocket(newSocket);\n  };\n\n  const scheduleReconnect = () => {\n    if (reconnectTimeoutRef.current) {\n      clearTimeout(reconnectTimeoutRef.current);\n    }\n    \n    const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000);\n    console.log(`Scheduling reconnect in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`);\n    \n    reconnectTimeoutRef.current = setTimeout(() => {\n      connect();\n    }, delay);\n  };\n\n  const disconnect = () => {\n    if (reconnectTimeoutRef.current) {\n      clearTimeout(reconnectTimeoutRef.current);\n      reconnectTimeoutRef.current = null;\n    }\n    \n    if (socket) {\n      console.log('Disconnecting WebSocket...');\n      socket.disconnect();\n      setSocket(null);\n    }\n    \n    setIsConnected(false);\n    setConnectionStatus('disconnected');\n    reconnectAttemptsRef.current = 0;\n  };\n\n  // Connect when authenticated\n  useEffect(() => {\n    if (isAuthenticated && token) {\n      connect();\n    } else {\n      disconnect();\n    }\n    \n    return () => {\n      disconnect();\n    };\n  }, [isAuthenticated, token]);\n\n  // Cleanup on unmount\n  useEffect(() => {\n    return () => {\n      disconnect();\n    };\n  }, []);\n\n  const value: WebSocketContextType = {\n    socket,\n    isConnected,\n    connectionStatus,\n    lastUpdate\n  };\n\n  return (\n    <WebSocketContext.Provider value={value}>\n      {children}\n    </WebSocketContext.Provider>\n  );\n};\n
+import React, { createContext, useContext, useEffect, useState, useRef } from 'react';
+import { io, Socket } from 'socket.io-client';
+import { useAuth } from './AuthContext';
+import { toast } from 'sonner';
+
+interface WebSocketContextType {
+  socket: Socket | null;
+  isConnected: boolean;
+  connectionStatus: 'connecting' | 'connected' | 'disconnected' | 'error';
+  lastUpdate: Date | null;
+}
+
+const WebSocketContext = createContext<WebSocketContextType>({
+  socket: null,
+  isConnected: false,
+  connectionStatus: 'disconnected',
+  lastUpdate: null
+});
+
+export const useWebSocket = () => {
+  const context = useContext(WebSocketContext);
+  if (!context) {
+    throw new Error('useWebSocket must be used within a WebSocketProvider');
+  }
+  return context;
+};
+
+interface WebSocketProviderProps {
+  children: React.ReactNode;
+  onShipmentUpdate?: (data: any) => void;
+}
+
+export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ 
+  children, 
+  onShipmentUpdate 
+}) => {
+  const { token, isAuthenticated } = useAuth();
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('disconnected');
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const maxReconnectAttempts = 5;
+
+  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000';
+  const WS_URL = API_BASE_URL.replace(/^http/, 'ws').replace(/^https/, 'wss');
+
+  const connect = () => {
+    if (!isAuthenticated || !token) {
+      console.log('Not authenticated, skipping WebSocket connection');
+      return;
+    }
+
+    console.log('Connecting to WebSocket...', WS_URL);
+    setConnectionStatus('connecting');
+
+    const newSocket = io(WS_URL, {
+      auth: {
+        token: token
+      },
+      transports: ['websocket', 'polling'],
+      timeout: 10000,
+      reconnection: true,
+      reconnectionAttempts: maxReconnectAttempts,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+    });
+
+    // Connection events
+    newSocket.on('connect', () => {
+      console.log('WebSocket connected successfully');
+      setIsConnected(true);
+      setConnectionStatus('connected');
+      reconnectAttemptsRef.current = 0;
+      
+      // Join shipment updates room
+      newSocket.emit('join_shipment_updates', { token });
+    });
+
+    newSocket.on('disconnect', (reason) => {
+      console.log('WebSocket disconnected:', reason);
+      setIsConnected(false);
+      setConnectionStatus('disconnected');
+      
+      // Attempt reconnection if not a manual disconnect
+      if (reason !== 'io client disconnect' && reconnectAttemptsRef.current < maxReconnectAttempts) {
+        scheduleReconnect();
+      }
+    });
+
+    newSocket.on('connect_error', (error) => {
+      console.error('WebSocket connection error:', error);
+      setIsConnected(false);
+      setConnectionStatus('error');
+      
+      reconnectAttemptsRef.current++;
+      if (reconnectAttemptsRef.current < maxReconnectAttempts) {
+        scheduleReconnect();
+      } else {
+        toast.error('Failed to connect to real-time updates. Please refresh the page.');
+      }
+    });
+
+    // Application events
+    newSocket.on('connection_status', (data) => {
+      console.log('Connection status:', data);
+      setLastUpdate(new Date());
+    });
+
+    newSocket.on('shipment_update', (data) => {
+      console.log('Received shipment update:', data);
+      setLastUpdate(new Date());
+      
+      // Show notification for status changes
+      if (data.type === 'status_change') {
+        toast.success(
+          `Shipment ${data.shipment.tracking_number} status updated to ${data.shipment.status}`,
+          {
+            duration: 5000,
+            action: {
+              label: 'View',
+              onClick: () => {
+                // Could scroll to shipment or open details
+                console.log('View shipment clicked');
+              }
+            }
+          }
+        );
+      } else if (data.type === 'new_shipment') {
+        toast.info(`New shipment added: ${data.shipment.tracking_number}`);
+      }
+      
+      // Call the callback if provided
+      if (onShipmentUpdate) {
+        onShipmentUpdate(data);
+      }
+    });
+
+    newSocket.on('joined_updates', (data) => {
+      if (data.status === 'success') {
+        console.log('Successfully joined shipment updates room');
+      } else {
+        console.error('Failed to join updates room:', data.message);
+      }
+    });
+
+    setSocket(newSocket);
+  };
+
+  const scheduleReconnect = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+    }
+    
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000);
+    console.log(`Scheduling reconnect in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`);
+    
+    reconnectTimeoutRef.current = setTimeout(() => {
+      connect();
+    }, delay);
+  };
+
+  const disconnect = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
+    if (socket) {
+      console.log('Disconnecting WebSocket...');
+      socket.disconnect();
+      setSocket(null);
+    }
+    
+    setIsConnected(false);
+    setConnectionStatus('disconnected');
+    reconnectAttemptsRef.current = 0;
+  };
+
+  // Connect when authenticated
+  useEffect(() => {
+    if (isAuthenticated && token) {
+      connect();
+    } else {
+      disconnect();
+    }
+    
+    return () => {
+      disconnect();
+    };
+  }, [isAuthenticated, token]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      disconnect();
+    };
+  }, []);
+
+  const value: WebSocketContextType = {
+    socket,
+    isConnected,
+    connectionStatus,
+    lastUpdate
+  };
+
+  return (
+    <WebSocketContext.Provider value={value}>
+      {children}
+    </WebSocketContext.Provider>
+  );
+};
