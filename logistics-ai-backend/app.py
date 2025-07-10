@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
 import openai
 import requests
@@ -43,6 +44,7 @@ CORS(app, resources={r"/*": {"origins": "*", "allow_headers": [
     "Authorization", "Content-Type"]}}, supports_credentials=True)
 db = SQLAlchemy(app)
 mail = Mail(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # API Keys
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -247,6 +249,79 @@ class Ship24API:
             logger.error(f"Error validating Ship24 API key: {e}")
             return False
 
+# WebSocket Authentication
+def authenticate_socket(auth_token):
+    """Authenticate WebSocket connection using JWT token"""
+    try:
+        if not auth_token:
+            return None
+        
+        # Remove 'Bearer ' prefix if present
+        if auth_token.startswith('Bearer '):
+            auth_token = auth_token[7:]
+            
+        data = jwt.decode(auth_token, app.config["SECRET_KEY"], algorithms=["HS256"])
+        user = User.query.get(data["user_id"])
+        return user
+    except Exception as e:
+        logger.error(f"WebSocket authentication failed: {e}")
+        return None
+
+# WebSocket Events
+@socketio.on('connect')
+def handle_connect(auth):
+    """Handle client connection"""
+    logger.info("Client attempting to connect to WebSocket")
+    
+    # Get token from auth data
+    token = auth.get('token') if auth else None
+    user = authenticate_socket(token)
+    
+    if not user:
+        logger.warning("WebSocket connection rejected - invalid auth")
+        return False  # Reject connection
+    
+    # Join user to their personal room for targeted updates
+    join_room(f"user_{user.id}")
+    logger.info(f"User {user.username} connected to WebSocket")
+    
+    # Send connection confirmation
+    emit('connection_status', {
+        'status': 'connected',
+        'message': 'Connected to real-time updates',
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    logger.info("Client disconnected from WebSocket")
+
+@socketio.on('join_shipment_updates')
+def handle_join_shipment_updates(data):
+    """Join room for shipment updates"""
+    token = data.get('token')
+    user = authenticate_socket(token)
+    
+    if user:
+        join_room(f"shipments_{user.id}")
+        emit('joined_updates', {'status': 'success'})
+        logger.info(f"User {user.username} joined shipment updates room")
+    else:
+        emit('joined_updates', {'status': 'error', 'message': 'Authentication failed'})
+
+def emit_shipment_update(user_id, shipment_data, update_type='status_change'):
+    """Emit real-time shipment update to specific user"""
+    try:
+        socketio.emit('shipment_update', {
+            'type': update_type,
+            'shipment': shipment_data,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room=f"user_{user_id}")
+        logger.info(f"Emitted shipment update to user {user_id}")
+    except Exception as e:
+        logger.error(f"Failed to emit shipment update: {e}")
+
 ship24 = Ship24API()
 
 # OpenAI Integration
@@ -428,6 +503,9 @@ def handle_shipments(current_user):
             db.session.commit()
             db_add_end_time = time.time()
             logger.info(f"DB commit took {db_add_end_time - db_add_start_time:.4f}s")
+            
+            # Emit real-time update for new shipment
+            emit_shipment_update(current_user.id, shipment.serialize(), 'new_shipment')
 
             end_time = time.time()
             logger.info(f"Total time to add shipment: {end_time - start_time:.4f}s")
@@ -462,10 +540,17 @@ def track_shipment_endpoint(current_user, tracking_number):
         
         # If we get new info, update shipment
         update_success = False
+        status_changed = False
+        old_status = shipment.status
+        
         if tracking_info:
             try:
                 # Update fields with new data
-                shipment.status = tracking_info.get("status", shipment.status)
+                new_status = tracking_info.get("status", shipment.status)
+                if new_status != old_status:
+                    status_changed = True
+                    
+                shipment.status = new_status
                 shipment.carrier = tracking_info.get("carrier", shipment.carrier)
                 shipment.origin = tracking_info.get("origin", shipment.origin)
                 shipment.destination = tracking_info.get("destination", shipment.destination)
@@ -482,6 +567,12 @@ def track_shipment_endpoint(current_user, tracking_number):
                 db.session.commit()
                 update_success = True
                 logger.info(f"Shipment {tracking_number} updated successfully")
+                
+                # Emit real-time update if status changed
+                if status_changed:
+                    emit_shipment_update(current_user.id, shipment.serialize(), 'status_change')
+                    logger.info(f"Status changed from {old_status} to {new_status} - WebSocket update sent")
+                    
             except Exception as e:
                 db.session.rollback()
                 logger.error(f"Error updating shipment: {e}")
@@ -490,6 +581,7 @@ def track_shipment_endpoint(current_user, tracking_number):
         return jsonify({
             "message": "Tracking information retrieved",
             "updated": update_success,
+            "status_changed": status_changed,
             "shipment": shipment.serialize()
         }), 200
             
@@ -557,4 +649,6 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
     start_email_monitoring()
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    
+    # Run with SocketIO support
+    socketio.run(app, debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
